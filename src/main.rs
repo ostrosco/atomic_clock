@@ -2,121 +2,194 @@
 #![no_main]
 
 extern crate panic_halt;
-use lazy_static::lazy_static;
 
-use core::cell::RefCell;
-use cortex_m::{interrupt::Mutex, peripheral::NVIC};
 use cortex_m_rt::entry;
 use cortex_m_semihosting::hprintln;
-use stm32f3::stm32f303::{self, interrupt, Interrupt, GPIOC, TIM2};
+use stm32f1xx_hal::{
+    pac, prelude::*, pwm_input::*, time::KiloHertz, timer::Timer,
+};
 
-static mut TIME_FRAME: [u8; 60] = [0; 60];
-static mut TIME_FRAME_IX: usize = 0;
-lazy_static! {
-    static ref MUTEX_GPIOC: Mutex<RefCell<Option<GPIOC>>> =
-        Mutex::new(RefCell::new(None));
-    static ref MUTEX_TIM2: Mutex<RefCell<Option<TIM2>>> =
-        Mutex::new(RefCell::new(None));
+// The sysclock is set to run at 48MHz, so we're prescaling down to a 10kHz clock and setting the
+// counter to 10000.
+const ARR: u16 = 10000;
+const PRESC: u16 = 4799;
+
+// Bounds for accepting a signal as one of the three values that WWVB can generate.
+const SYNC_MIN: u16 = 1000;
+const SYNC_MAX: u16 = 3000;
+const ONE_MIN: u16 = 4000;
+const ONE_MAX: u16 = 6000;
+const ZERO_MIN: u16 = 7000;
+const ZERO_MAX: u16 = 9000;
+
+#[derive(PartialEq)]
+enum SyncState {
+    NotSynced,
+    FirstSync,
+    Synced,
 }
 
 #[entry]
 fn main() -> ! {
-    let stm_perip = stm32f303::Peripherals::take().unwrap();
-    let mut cortex_perip = cortex_m::Peripherals::take().unwrap();
-    let rcc = &stm_perip.RCC;
-    let gpioc = &stm_perip.GPIOC;
+    let perip = pac::Peripherals::take().unwrap();
+    let mut flash = perip.FLASH.constrain();
+    let mut rcc = perip.RCC.constrain();
 
-    // Enable the clock on GPIOC.
-    rcc.ahbenr.write(|w| w.iopcen().enabled());
+    // We're going to freeze the clock immediately. The target platform here is the STM32 Black
+    // Pill which by default runs at 8MHz which is what we're expecting to see here.
+    let clocks = rcc
+        .cfgr
+        .use_hse(8.mhz())
+        .sysclk(48.mhz())
+        .pclk1(24.mhz())
+        .freeze(&mut flash.acr);
+    let mut afio = perip.AFIO.constrain(&mut rcc.apb2);
+    let mut dbg = perip.DBGMCU;
 
-    // Configure PC5 on the board to be an floating input.
-    gpioc.moder.write(|w| w.moder5().input());
-    gpioc.pupdr.write(|w| unsafe { w.pupdr5().bits(0b00) });
+    let gpioa = perip.GPIOA.split(&mut rcc.apb2);
+    let gpiob = perip.GPIOB.split(&mut rcc.apb2);
 
-    // Configure TIM2 to use as an interrupt for sampling the WWVB signal.
-    configure_clock(&stm_perip);
+    // We need to disable JTAG support here for PB4 so we can use it for PWM input capture.
+    let (_pa15, _pb3, pb4) =
+        afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
+    let pb5 = gpiob.pb5;
 
-    cortex_m::interrupt::free(|cs| {
-        MUTEX_GPIOC.borrow(cs).replace(Some(stm_perip.GPIOC));
-        MUTEX_TIM2.borrow(cs).replace(Some(stm_perip.TIM2));
-    });
+    let config: Configuration<KiloHertz> = Configuration::RawValues {
+        arr: ARR,
+        presc: PRESC,
+    };
+    let pwm_input = Timer::tim3(perip.TIM3, &clocks, &mut rcc.apb1).pwm_input(
+        (pb4, pb5),
+        &mut afio.mapr,
+        &mut dbg,
+        config,
+    );
 
-    // Enable the NVIC interrupt for TIM2.
-    let nvic = &mut cortex_perip.NVIC;
-    unsafe {
-        NVIC::unmask(Interrupt::TIM2);
-        nvic.set_priority(Interrupt::TIM2, 0x01);
-    }
-    NVIC::unpend(Interrupt::TIM2);
+    let mut time_slice = [0u16; 60];
+    let mut slice_ix = 0;
+    let mut sync_state = SyncState::NotSynced;
 
-    unsafe {
-        cortex_m::interrupt::enable();
-    }
+    loop {
+        if let Ok((duty_cycle, period)) =
+            pwm_input.read_duty(ReadMode::WaitForNextCapture)
+        {
+            // Correct for counter rollover when calculating the duty.
+            let duty = if period < duty_cycle {
+                period + ARR - duty_cycle
+            } else {
+                period - duty_cycle
+            };
 
-    loop {}
-}
-
-fn configure_clock(stm_perip: &stm32f303::Peripherals) {
-    let tim2 = &stm_perip.TIM2;
-    let rcc = &stm_perip.RCC;
-
-    // Disable TIM2 before we start configuring.
-    tim2.cr1.write(|w| w.cen().disabled());
-
-    // Enable APB1_CLOCK going to TIM2.
-    rcc.apb1enr.write(|w| w.tim2en().enabled());
-
-    // Reset TIM2.
-    rcc.apb1rstr
-        .write(|w| w.tim2rst().set_bit().tim2rst().clear_bit());
-
-    // The APB1_CLOCK that drives TIM2 runs at 8MHz by default, so prescale
-    // down to 1kHz and then sample every 100ms.
-    tim2.psc.write(|w| w.psc().bits(7_999));
-    tim2.arr.write(|w| w.arr().bits(100));
-
-    // Apply the settings and reset the timer.
-    tim2.egr.write(|w| w.ug().update());
-
-    // Enable an update interrupt for TIM2.
-    tim2.dier.write(|w| w.uie().enabled());
-
-    // Re-enable TIM2.
-    tim2.cr1.write(|w| w.cen().enabled());
-}
-
-#[interrupt]
-fn TIM2() {
-    static mut BYTES: [u8; 10] = [0; 10];
-    static mut INDEX: usize = 0;
-
-    let value = cortex_m::interrupt::free(|cs| {
-        let tim2 = MUTEX_TIM2.borrow(cs).borrow();
-        let tim2 = tim2.as_ref()?;
-        tim2.sr.write(|w| w.uif().clear());
-        let refcell = MUTEX_GPIOC.borrow(cs).borrow();
-        let gpioc = refcell.as_ref()?;
-        Some(gpioc.idr.read().idr5().bit())
-    });
-
-    BYTES[*INDEX] = if value.unwrap() { 1 } else { 0 };
-    if *INDEX >= 9 {
-        *INDEX = 0;
-        let byte = match BYTES {
-            [0, 0, 0, 0, 0, 1, 1, 1, 1, 1] => {
-                hprintln!("Got a 1 bit").unwrap();
-                1
+            if sync_state == SyncState::Synced {
+                if duty > SYNC_MIN && duty < SYNC_MAX {
+                    // We only expect sync signals at bits 0, 9, 19, 29, 39, 49, and 59. If we get
+                    // a sync outside these bounds, we must have missed something and we should
+                    // assume that our data is borked and need to resync.
+                    if slice_ix == 0
+                        || slice_ix == 9
+                        || slice_ix == 19
+                        || slice_ix == 29
+                        || slice_ix == 39
+                        || slice_ix == 49
+                        || slice_ix == 59
+                    {
+                        time_slice[slice_ix] = 2;
+                        slice_ix += 1;
+                    } else {
+                        hprintln!(
+                            "Invalid sync received at {}, resyncing",
+                            slice_ix
+                        )
+                        .unwrap();
+                        sync_state = SyncState::NotSynced;
+                        time_slice = [0; 60];
+                        slice_ix = 0;
+                    }
+                } else if duty > ONE_MIN && duty < ONE_MAX {
+                    time_slice[slice_ix] = 1;
+                    slice_ix += 1;
+                } else if duty > ZERO_MIN && duty < ZERO_MAX {
+                    time_slice[slice_ix] = 0;
+                    slice_ix += 1;
+                } else {
+                    // If we get something that we don't recognize, there's no error recovery we
+                    // can do on the data. Consider this minute a wash and wait for the next sync.
+                    hprintln!("Unknown pulse, waiting for resync").unwrap();
+                    sync_state = SyncState::NotSynced;
+                    slice_ix = 0;
+                }
+            } else {
+                // WWVB will output two sync messages to indicate the start of a frame. Once we get
+                // the second sync, save it into the frame as it's technically the first second of
+                // data in the frame.
+                if duty > SYNC_MIN && duty < SYNC_MAX {
+                    if sync_state == SyncState::NotSynced {
+                        sync_state = SyncState::FirstSync;
+                    } else {
+                        hprintln!("Synced to WWVB").unwrap();
+                        sync_state = SyncState::Synced;
+                        time_slice[0] = 2;
+                        slice_ix = 1;
+                    }
+                } else {
+                    sync_state = SyncState::NotSynced;
+                }
             }
-            [0, 0, 1, 1, 1, 1, 1, 1, 1, 1] => {
-                hprintln!("Got a 0 bit").unwrap();
-                0
+        }
+
+        if slice_ix == 60 {
+            let minute = 40 * time_slice[1]
+                + 20 * time_slice[2]
+                + 10 * time_slice[3]
+                + 8 * time_slice[5]
+                + 4 * time_slice[6]
+                + 2 * time_slice[7]
+                + time_slice[8];
+
+            let hour = 20 * time_slice[12]
+                + 10 * time_slice[13]
+                + 8 * time_slice[15]
+                + 4 * time_slice[16]
+                + 2 * time_slice[17]
+                + time_slice[18];
+
+            let doy = 200 * time_slice[22]
+                + 100 * time_slice[23]
+                + 80 * time_slice[25]
+                + 40 * time_slice[26]
+                + 20 * time_slice[27]
+                + 10 * time_slice[28]
+                + 8 * time_slice[30]
+                + 4 * time_slice[31]
+                + 2 * time_slice[32]
+                + time_slice[33];
+
+            let year = 80 * time_slice[45]
+                + 40 * time_slice[46]
+                + 20 * time_slice[47]
+                + 10 * time_slice[48]
+                + 8 * time_slice[50]
+                + 4 * time_slice[51]
+                + 2 * time_slice[52]
+                + time_slice[53];
+
+            if minute >= 60 || hour >= 24 || doy >= 367 || year >= 99 {
+                hprintln!("Invalid minute received, resyncing.").unwrap();
+                sync_state = SyncState::NotSynced;
+                continue;
+            } else {
+                hprintln!(
+                    "Time: {:02}:{:02}, 20{}-{}",
+                    hour,
+                    minute,
+                    year,
+                    doy
+                )
+                .unwrap();
             }
-            _ => {
-                hprintln!("Unknown byte sequence").unwrap();
-                0
-            }
-        };
-    } else {
-        *INDEX += 1;
+
+            time_slice = [0; 60];
+            slice_ix = 0;
+        }
     }
 }
