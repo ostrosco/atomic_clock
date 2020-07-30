@@ -4,13 +4,23 @@
 extern crate panic_halt;
 
 pub mod consts;
+pub mod rtc;
 pub mod wwvb;
 
 use crate::wwvb::WWVBError;
+use core::cell::RefCell;
+use core::ops::DerefMut;
+use cortex_m::interrupt::Mutex;
 use cortex_m_rt::entry;
 use cortex_m_semihosting::hprintln;
 use stm32f1xx_hal::{
-    pac, prelude::*, pwm_input::*, time::KiloHertz, timer::Timer,
+    device::NVIC,
+    pac::{self, interrupt, Interrupt},
+    prelude::*,
+    pwm_input::*,
+    rtc::Rtc,
+    time::KiloHertz,
+    timer::Timer,
 };
 
 #[derive(PartialEq)]
@@ -20,11 +30,19 @@ enum SyncState {
     Synced,
 }
 
+static RTC: Mutex<RefCell<Option<Rtc>>> = Mutex::new(RefCell::new(None));
+
 #[entry]
 fn main() -> ! {
     let perip = pac::Peripherals::take().unwrap();
+    let cortex_perip = cortex_m::Peripherals::take().unwrap();
     let mut flash = perip.FLASH.constrain();
     let mut rcc = perip.RCC.constrain();
+
+    // Set the vector table offset register to point to the start of FLASh for this board.
+    unsafe {
+        cortex_perip.SCB.vtor.write(0x08000000);
+    }
 
     let clocks = rcc
         .cfgr
@@ -32,8 +50,27 @@ fn main() -> ! {
         .sysclk(48.mhz())
         .pclk1(24.mhz())
         .freeze(&mut flash.acr);
+
     let mut afio = perip.AFIO.constrain(&mut rcc.apb2);
     let mut dbg = perip.DBGMCU;
+    let mut pwr = perip.PWR;
+    let mut backup_domain =
+        rcc.bkp.constrain(perip.BKP, &mut rcc.apb1, &mut pwr);
+
+    let mut rtc = Rtc::rtc(perip.RTC, &mut backup_domain);
+    rtc.listen_alarm();
+
+    let mut nvic = cortex_perip.NVIC;
+    unsafe {
+        nvic.set_priority(Interrupt::RTC, 3);
+        NVIC::unmask(Interrupt::RTC);
+    }
+    NVIC::unpend(Interrupt::RTC);
+
+    cortex_m::interrupt::free(|cs| {
+        rtc.set_alarm(rtc.current_time() + 1);
+        *RTC.borrow(cs).borrow_mut() = Some(rtc);
+    });
 
     let gpioa = perip.GPIOA.split(&mut rcc.apb2);
     let gpiob = perip.GPIOB.split(&mut rcc.apb2);
@@ -114,23 +151,39 @@ fn main() -> ! {
             let doy = wwvb::calc_doy(&frame);
             let year = wwvb::calc_year(&frame);
             let leap_year = wwvb::is_leap_year(&frame);
-            let (date_year, date_month, date_day) =
-                wwvb::to_date(year, doy, leap_year);
+            let (date_year, _, _) = wwvb::to_date(year, doy, leap_year);
 
             if minute >= 60 || hour >= 24 || doy >= 367 || year >= 99 {
                 hprintln!("Invalid minute received, resyncing.").unwrap();
                 sync_state = SyncState::NotSynced;
                 continue;
             } else {
-                // For now, we're just going to print out the date and time as we don't have a
-                // display hooked up to the interface.
-                hprintln!("Time: {:02}:{:02}", hour, minute,).unwrap();
-                hprintln!("Date: {}-{}-{}", date_year, date_month, date_day)
-                    .unwrap();
+                // Calculate the Unix timestamp. Keep in mind that since the WWVB frame we receive
+                // is from the previous minute, we need to add 60 seconds to represent the _actual_
+                // minute we're currently starting.
+                let unix_ts = rtc::to_timestamp(date_year, doy, hour, minute);
+                cortex_m::interrupt::free(|cs| {
+                    if let Some(ref mut rtc) =
+                        *RTC.borrow(cs).borrow_mut().deref_mut()
+                    {
+                        rtc.set_time(unix_ts);
+                    }
+                });
+                hprintln!("Unix time: {}", unix_ts).unwrap();
             }
 
             frame = [0; 60];
             slice_ix = 0;
         }
     }
+}
+
+#[interrupt]
+fn RTC() {
+    cortex_m::interrupt::free(|cs| {
+        if let Some(ref mut rtc) = *RTC.borrow(cs).borrow_mut().deref_mut() {
+            rtc.set_alarm(rtc.current_time() + 1);
+            rtc.clear_alarm_flag();
+        }
+    });
 }
