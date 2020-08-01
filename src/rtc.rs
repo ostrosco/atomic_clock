@@ -13,6 +13,27 @@ pub fn to_timestamp(year: u16, doy: u16, hour: u16, minute: u16) -> u32 {
         + num_leaps * secs_in_day
 }
 
+pub fn from_timestamp(unix_ts: u32) -> (u32, u32, u32, u32, u32) {
+    let mut unix_ts = unix_ts;
+    let year = unix_ts / (24 * 60 * 60 * 365);
+    unix_ts %= 24 * 60 * 60 * 365;
+
+    // The year we get out of this calculation is the number of years since 1970.
+    let year_u16 = year as u16 + 1970;
+
+    // We need to compensate for the number of leap years when calculating the day of year.
+    let num_leaps = calc_num_leap_years(year_u16);
+    let doy = unix_ts / (24 * 60 * 60) - num_leaps + 1;
+    unix_ts %= 24 * 60 * 60;
+
+    let hour = unix_ts / (60 * 60);
+    unix_ts %= 60 * 60;
+    let minute = unix_ts / 60;
+    let seconds = unix_ts % 60;
+
+    (year + 1970, doy, hour, minute, seconds)
+}
+
 fn calc_num_leap_years(year: u16) -> u32 {
     let mut num_leaps = 0u32;
 
