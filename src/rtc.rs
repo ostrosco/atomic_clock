@@ -46,3 +46,29 @@ fn calc_num_leap_years(year: u16) -> u32 {
     }
     num_leaps
 }
+
+fn is_leap_year(year: u16) -> bool {
+    (year % 400 == 0 || year % 100 != 0) && year % 4 == 0
+}
+
+/// Calculates the year, month, and day based off the data from RTC.
+pub fn to_date(year: u16, doy: u16) -> (u16, u16, u16) {
+    let mut days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let is_leap = is_leap_year(year);
+    if is_leap {
+        days_in_month[1] += 1;
+    }
+
+    let mut month = 0;
+    let mut day = doy;
+    for (iter_month, num_days) in days_in_month.iter().enumerate() {
+        if day > *num_days {
+            day -= num_days;
+        } else {
+            month = iter_month + 1;
+            break;
+        }
+    }
+
+    (year, month as u16, day)
+}
