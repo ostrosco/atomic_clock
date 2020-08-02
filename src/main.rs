@@ -13,7 +13,6 @@ use core::fmt::Write;
 use core::ops::DerefMut;
 use cortex_m::interrupt::Mutex;
 use cortex_m_rt::entry;
-use cortex_m_semihosting::hprintln;
 use nb::block;
 use stm32f1xx_hal::{
     delay::Delay,
@@ -34,8 +33,14 @@ enum SyncState {
     Synced,
 }
 
-static RTC: Mutex<RefCell<Option<Rtc>>> = Mutex::new(RefCell::new(None));
+// Mutex for access to the real-time clock. This is shared between the RTC interrupt and the main
+// loop of the program.
+static G_RTC: Mutex<RefCell<Option<Rtc>>> = Mutex::new(RefCell::new(None));
+
+// Mutex for USART1. This is consumed when the first RTC interrupt fires.
 static G_USART: Mutex<RefCell<Option<Tx1>>> = Mutex::new(RefCell::new(None));
+
+// Mutex for the delay. This is consumed when the first RTC interrupt fires.
 static G_DELAY: Mutex<RefCell<Option<Delay>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
@@ -44,13 +49,6 @@ fn main() -> ! {
     let cortex_perip = cortex_m::Peripherals::take().unwrap();
     let mut flash = perip.FLASH.constrain();
     let mut rcc = perip.RCC.constrain();
-
-    // Set the vector table offset register to point to the start of FLASH for this board.
-    /*
-    unsafe {
-        cortex_perip.SCB.vtor.write(0x08000000);
-    }
-    */
 
     let clocks = rcc
         .cfgr
@@ -105,9 +103,8 @@ fn main() -> ! {
     // Clear the display.
     send_cmd_to_display(b"\xfe\x51", &mut tx, &mut delay, 100_u16);
 
-
     // Configure the real time clock. Here we are using an alarm interrupt versus the seconds
-    // interrupt. For some reason, enabling the seconds interrupt would cause the board to hand
+    // interrupt. For some reason, enabling the seconds interrupt would cause the board to hang
     // indefinitely so we just set alarms to trigger every second.
     let mut rtc = Rtc::rtc(perip.RTC, &mut backup_domain);
     rtc.listen_alarm();
@@ -121,7 +118,7 @@ fn main() -> ! {
     // Move the RTC and the USART into their appropriate mutexes and set up our first alarm.
     cortex_m::interrupt::free(|cs| {
         rtc.set_alarm(rtc.current_time() + 1);
-        *RTC.borrow(cs).borrow_mut() = Some(rtc);
+        *G_RTC.borrow(cs).borrow_mut() = Some(rtc);
         *G_USART.borrow(cs).borrow_mut() = Some(tx);
         *G_DELAY.borrow(cs).borrow_mut() = Some(delay);
     });
@@ -147,14 +144,15 @@ fn main() -> ! {
                         frame[slice_ix] = val;
                         slice_ix += 1;
                     }
+                    // WWVB does not offer any error correction. So if we get an invalid pulse or
+                    // we've missed a bit somehow, we can only throw away this frame, resync, and
+                    // try again.
                     Err(WWVBError::InvalidSync) => {
-                        hprintln!("Invalid sync received").unwrap();
                         sync_state = SyncState::NotSynced;
                         frame = [0; 60];
                         slice_ix = 0;
                     }
                     Err(WWVBError::UnknownSignal) => {
-                        hprintln!("Unknown signal received").unwrap();
                         sync_state = SyncState::NotSynced;
                         frame = [0; 60];
                         slice_ix = 0;
@@ -168,7 +166,6 @@ fn main() -> ! {
                     if sync_state == SyncState::NotSynced {
                         sync_state = SyncState::FirstSync;
                     } else {
-                        hprintln!("Synced to WWVB").unwrap();
                         sync_state = SyncState::Synced;
                         frame[0] = 2;
                         slice_ix = 1;
@@ -192,15 +189,14 @@ fn main() -> ! {
                 continue;
             } else {
                 // Calculate the Unix timestamp. Keep in mind that since the WWVB frame we receive
-                // is from the previous minute, we need to add 60 seconds to represent the _actual_
-                // minute we're currently starting.
-                //
-                // TODO: right now we're about a second off.
+                // is from the previous minute, we need to add 60 seconds to represent the actual
+                // minute we're currently starting. We're also behind one second when doing this
+                // calculation so we compensate for that here.
                 let unix_ts =
-                    rtc::to_timestamp(date_year, doy, hour, minute) + 60;
+                    rtc::to_timestamp(date_year, doy, hour, minute) + 61;
                 cortex_m::interrupt::free(|cs| {
                     if let Some(ref mut rtc) =
-                        *RTC.borrow(cs).borrow_mut().deref_mut()
+                        *G_RTC.borrow(cs).borrow_mut().deref_mut()
                     {
                         rtc.set_time(unix_ts);
                         rtc.set_alarm(unix_ts + 1);
@@ -244,15 +240,21 @@ fn RTC() {
     });
 
     cortex_m::interrupt::free(|cs| {
-        if let Some(ref mut rtc) = *RTC.borrow(cs).borrow_mut().deref_mut() {
+        if let Some(ref mut rtc) = *G_RTC.borrow(cs).borrow_mut().deref_mut() {
             // Write the current time to the display and set up the next second's alarm.
             let time = rtc.current_time();
             // Reset the cursor to the first position before drawing instead of clearing each time.
-            send_cmd_to_display(b"\xfe\x45\x00", &mut tx, &mut delay, 100_u16);
             let (year, doy, hour, minute, second) = rtc::from_timestamp(time);
+            let (year, month, day) = rtc::to_date(year as u16, doy as u16);
+
+            // Write the current time to the first line of the display and the current date to the
+            // second line of the display.
+            send_cmd_to_display(b"\xfe\x45\x00", &mut tx, &mut delay, 100_u16);
             write!(tx, "{:02}:{:02}:{:02}", hour, minute, second).unwrap();
             send_cmd_to_display(b"\xfe\x45\x40", &mut tx, &mut delay, 100_u16);
-            write!(tx, "{}-{:03}", year, doy).unwrap();
+            write!(tx, "{}-{:02}-{:02}", year, month, day).unwrap();
+
+            // Clear the interrupt flag and set another alarm to take place one second later.
             rtc.clear_alarm_flag();
             rtc.set_alarm(rtc.current_time() + 1);
         }
