@@ -4,10 +4,10 @@
 extern crate panic_halt;
 
 pub mod consts;
-pub mod rtc;
+pub mod time;
 pub mod wwvb;
 
-use crate::wwvb::WWVBError;
+use crate::time::Timestamp;
 use core::cell::RefCell;
 use core::fmt::Write;
 use core::ops::DerefMut;
@@ -147,12 +147,7 @@ fn main() -> ! {
                     // WWVB does not offer any error correction. So if we get an invalid pulse or
                     // we've missed a bit somehow, we can only throw away this frame, resync, and
                     // try again.
-                    Err(WWVBError::InvalidSync) => {
-                        sync_state = SyncState::NotSynced;
-                        frame = [0; 60];
-                        slice_ix = 0;
-                    }
-                    Err(WWVBError::UnknownSignal) => {
+                    Err(_) => {
                         sync_state = SyncState::NotSynced;
                         frame = [0; 60];
                         slice_ix = 0;
@@ -177,36 +172,43 @@ fn main() -> ! {
         }
 
         if slice_ix == 60 {
-            let minute = wwvb::calc_minute(&frame);
-            let hour = wwvb::calc_hour(&frame);
-            let doy = wwvb::calc_doy(&frame);
-            let year = wwvb::calc_year(&frame);
-            let leap_year = wwvb::is_leap_year(&frame);
-            let (date_year, _, _) = wwvb::to_date(year, doy, leap_year);
-
-            if minute >= 60 || hour >= 24 || doy >= 367 || year >= 99 {
+            if let Err(_) = set_rtc(&frame) {
                 sync_state = SyncState::NotSynced;
                 continue;
-            } else {
-                // Calculate the Unix timestamp. Keep in mind that since the WWVB frame we receive
-                // is from the previous minute, we need to add 60 seconds to represent the actual
-                // minute we're currently starting. We're also behind one second when doing this
-                // calculation so we compensate for that here.
-                let unix_ts =
-                    rtc::to_timestamp(date_year, doy, hour, minute) + 61;
-                cortex_m::interrupt::free(|cs| {
-                    if let Some(ref mut rtc) =
-                        *G_RTC.borrow(cs).borrow_mut().deref_mut()
-                    {
-                        rtc.set_time(unix_ts);
-                        rtc.set_alarm(unix_ts + 1);
-                    }
-                });
             }
-
             frame = [0; 60];
             slice_ix = 0;
         }
+    }
+}
+
+fn set_rtc(frame: &[u16; 60]) -> Result<(), ()> {
+    let minute = wwvb::calc_minute(&frame);
+    let hour = wwvb::calc_hour(&frame);
+    let doy = wwvb::calc_doy(&frame);
+    let year = wwvb::calc_year(&frame);
+    let leap_year = wwvb::is_leap_year(&frame);
+    let (date_year, _, _) = wwvb::to_date(year, doy, leap_year);
+
+    if minute >= 60 || hour >= 24 || doy >= 367 || year >= 99 {
+        Err(())
+    } else {
+        let timestamp = Timestamp::new(date_year, doy, hour, minute, 0);
+
+        cortex_m::interrupt::free(|cs| {
+            if let Some(ref mut rtc) =
+                *G_RTC.borrow(cs).borrow_mut().deref_mut()
+            {
+                // Calculate the Unix timestamp. Keep in mind that since the WWVB frame we
+                // receive is from the previous minute, we need to add 60 seconds to represent
+                // the actual minute we're currently starting. We're also behind one second
+                // when doing this calculation so we compensate for that here.
+                let unix_ts = timestamp.to_unix() + 61;
+                rtc.set_time(unix_ts);
+                rtc.set_alarm(unix_ts + 1);
+            }
+        });
+        Ok(())
     }
 }
 
@@ -244,15 +246,21 @@ fn RTC() {
             // Write the current time to the display and set up the next second's alarm.
             let time = rtc.current_time();
             // Reset the cursor to the first position before drawing instead of clearing each time.
-            let (year, doy, hour, minute, second) = rtc::from_timestamp(time);
-            let (year, month, day) = rtc::to_date(year as u16, doy as u16);
+            let time = Timestamp::from_unix(time);
+            let date = time.to_date();
 
             // Write the current time to the first line of the display and the current date to the
             // second line of the display.
             send_cmd_to_display(b"\xfe\x45\x00", &mut tx, &mut delay, 100_u16);
-            write!(tx, "{:02}:{:02}:{:02}", hour, minute, second).unwrap();
+            write!(
+                tx,
+                "{:02}:{:02}:{:02}",
+                time.hour, time.minute, time.seconds
+            )
+            .unwrap();
             send_cmd_to_display(b"\xfe\x45\x40", &mut tx, &mut delay, 100_u16);
-            write!(tx, "{}-{:02}-{:02}", year, month, day).unwrap();
+            write!(tx, "{}-{:02}-{:02}", date.year, date.month, date.day)
+                .unwrap();
 
             // Clear the interrupt flag and set another alarm to take place one second later.
             rtc.clear_alarm_flag();
