@@ -13,6 +13,7 @@ use core::fmt::Write;
 use core::ops::DerefMut;
 use cortex_m::interrupt::Mutex;
 use cortex_m_rt::entry;
+use embedded_hal::digital::v2::OutputPin;
 use nb::block;
 use stm32f1xx_hal::{
     delay::Delay,
@@ -64,14 +65,18 @@ fn main() -> ! {
         rcc.bkp.constrain(perip.BKP, &mut rcc.apb1, &mut pwr);
 
     let mut gpioa = perip.GPIOA.split(&mut rcc.apb2);
-    let gpiob = perip.GPIOB.split(&mut rcc.apb2);
+    let mut gpiob = perip.GPIOB.split(&mut rcc.apb2);
     let tx = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
     let rx = gpioa.pa10;
 
     // We need to disable JTAG support here for PB4 so we can use it for PWM input capture.
-    let (_pa15, _pb3, pb4) =
+    let (_pa15, pb3, pb4) =
         afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
     let pb5 = gpiob.pb5;
+
+    // Control the PDN pin to trigger the fast startup on the WWVB receiver.
+    let mut power_on = pb3.into_open_drain_output(&mut gpiob.crl);
+    power_on.set_low().unwrap();
 
     // Configure the USART for talking to the display.
     let serial = Serial::usart1(

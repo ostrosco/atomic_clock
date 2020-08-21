@@ -9,6 +9,7 @@ version = "0.1.0"
 as-slice = "0.1"
 cortex-m = "0.6"
 cortex-m-rt = "0.6"
+embedded-hal = "0.2"
 lazy_static = { version = "1", features = ["spin_no_std"] }
 panic-halt = "0.2"
 nb = "1"
